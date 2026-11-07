@@ -122,7 +122,7 @@ def build(specialization):
                         frequency1 = T.simd.alloc_var("uint16")
                         frequency0 = T.simd.vdup(T.uint16(0), "uint16", mask16)
                         frequency1 = T.simd.vdup(T.uint16(0), "uint16", mask16)
-                        selected_prefix = T.cast(T.reinterpret("uint32", prefix_ub[0]), bit_dtype)
+                        selected_prefix = T.cast(T.reinterpret(prefix_ub[0], "uint32"), bit_dtype)
                         rank_value = rank_ub[0]
                         sign_vector = T.simd.vdup(T.cast(sign_bit, bit_dtype), bit_dtype, mask)
                         word_vector = T.simd.vdup(T.cast(word_mask, bit_dtype), bit_dtype, mask)
@@ -174,10 +174,10 @@ def build(specialization):
                             for vector_index in T.serial(chunk // vector_lanes):
                                 if (piece < last_piece) | (vector_index < tail // vector_lanes):
                                     original = T.reinterpret(
-                                        bit_vector_dtype,
                                         T.simd.vld(
                                             values[vector_index * vector_lanes], dist="NORM"
                                         ),
+                                        bit_vector_dtype,
                                     )
                                     magnitude = T.simd.vand(original, magnitude_vector, mask)
                                     positive_key = T.simd.vxor(original, sign_vector, mask)
@@ -287,7 +287,7 @@ def build(specialization):
                                         excluded_vector,
                                         T.simd.vcmps(key_prefix, selected_prefix, mask, op="eq"),
                                     )
-                                    digit_bytes = T.reinterpret("uint8x256", encoded)
+                                    digit_bytes = T.reinterpret(encoded, "uint8x256")
                                     T.simd.chistv2(frequency0, digit_bytes, mask8, bin=0)
                                     T.simd.chistv2(frequency1, digit_bytes, mask8, bin=1)
                         T.simd.vsts(frequencies[0], frequency0, mask16, dist="NORM_B16")
@@ -348,26 +348,26 @@ def build(specialization):
                             if digit + 1 == choice_result[0]:
                                 T.reducer_update(before[0], cumulative[digit])
                         T.finalize_reducer(before, before_result)
-                        next_prefix[0] = T.reinterpret("uint32", prefix_ub[0]) | (
+                        next_prefix[0] = T.reinterpret(prefix_ub[0], "uint32") | (
                             T.cast(255 - choice_result[0], "uint32") << shift
                         )
                         next_rank[0] = residual_ub[0] - before_result[0]
                         for lane in T.Parallel(1):
-                            prefix_ub[lane] = T.reinterpret("int32", next_prefix[lane])
+                            prefix_ub[lane] = T.reinterpret(next_prefix[lane], "int32")
                             residual_ub[lane] = next_rank[lane]
                     T.ascend_pipe_barrier("PIPE_ALL")
 
                 with T.SimdVF():
                     mask = T.simd.pset(bit_width)
-                    threshold_key = T.reinterpret("uint32", prefix_ub[0])
+                    threshold_key = T.reinterpret(prefix_ub[0], "uint32")
                     rank_value = rank_ub[0]
                     masked = T.simd.vdup(T.cast(negative_infinity_bits, bit_dtype), bit_dtype, mask)
                     filtered = T.simd.alloc_var(bit_dtype)
                     for vector_index in T.serial(chunk // vector_lanes):
                         if (piece < last_piece) | (vector_index < tail // vector_lanes):
                             original = T.reinterpret(
-                                bit_vector_dtype,
                                 T.simd.vld(values[vector_index * vector_lanes], dist="NORM"),
+                                bit_vector_dtype,
                             )
                             filtered = original
                             if rank_value < vocab:
@@ -426,7 +426,7 @@ def build(specialization):
                                     )
                             T.simd.vsts(
                                 output_values[vector_index * vector_lanes],
-                                T.reinterpret(value_vector_dtype, filtered),
+                                T.reinterpret(filtered, value_vector_dtype),
                                 mask,
                                 dist=store_dist,
                             )
@@ -529,14 +529,14 @@ def build(specialization):
                                 T.reducer_update(before[0], cumulative[digit])
                         T.finalize_reducer(before, before_result)
                         prefix[0] = (
-                            T.reinterpret("uint32", PreviousPrefix[row])
+                            T.reinterpret(PreviousPrefix[row], "uint32")
                             & T.uint32(merge_higher_mask)
                         ) | (T.cast(radix - 1 - choice_result[0], "uint32") << safe_merge_shift)
                         residual[0] = PreviousRank[row] - before_result[0]
                         for lane in T.Parallel(1):
-                            prefix_ub[lane] = T.reinterpret("int32", prefix[lane])
+                            prefix_ub[lane] = T.reinterpret(prefix[lane], "int32")
                             if piece == 0:
-                                NextPrefix[row] = T.reinterpret("int32", prefix[lane])
+                                NextPrefix[row] = T.reinterpret(prefix[lane], "int32")
                                 NextRank[row] = residual[lane]
                 else:
                     T.copy(PreviousPrefix[row : row + 1], prefix_ub[0:1])
@@ -555,7 +555,7 @@ def build(specialization):
                 if shift >= 0:
                     if not aligned_rows:
                         with T.SimtVF(threads=threads):
-                            selected_prefix = T.reinterpret("uint32", prefix_ub[0]) & T.uint32(
+                            selected_prefix = T.reinterpret(prefix_ub[0], "uint32") & T.uint32(
                                 higher_mask
                             )
                             for encode_round in T.serial(encode_rounds):
@@ -567,7 +567,7 @@ def build(specialization):
                                         if col < vocab:  # noqa: SIM102
                                             if K[row] < vocab:
                                                 bits = T.cast(
-                                                    T.reinterpret(bit_dtype, values[local_col]),
+                                                    T.reinterpret(values[local_col], bit_dtype),
                                                     "uint32",
                                                 )
                                                 magnitude = bits & T.uint32(magnitude_mask)
@@ -615,7 +615,7 @@ def build(specialization):
                             mask = T.simd.pset(bit_width)
                             rank_value = rank_ub[0]
                             selected_prefix = T.cast(
-                                T.reinterpret("uint32", prefix_ub[0]) & T.uint32(higher_mask),
+                                T.reinterpret(prefix_ub[0], "uint32") & T.uint32(higher_mask),
                                 bit_dtype,
                             )
                             sign_vector = T.simd.vdup(T.cast(sign_bit, bit_dtype), bit_dtype, mask)
@@ -668,10 +668,10 @@ def build(specialization):
                                 for vector_index in T.serial(chunk // vector_lanes):
                                     if (piece < last_piece) | (vector_index < tail // vector_lanes):
                                         original = T.reinterpret(
-                                            bit_vector_dtype,
                                             T.simd.vld(
                                                 values[vector_index * vector_lanes], dist="NORM"
                                             ),
+                                            bit_vector_dtype,
                                         )
                                         magnitude = T.simd.vand(original, magnitude_vector, mask)
                                         positive_key = T.simd.vxor(original, sign_vector, mask)
@@ -802,7 +802,7 @@ def build(specialization):
                                                 key_prefix, selected_prefix, mask, op="eq"
                                             ),
                                         )
-                                        digit_bytes = T.reinterpret("uint8x256", encoded)
+                                        digit_bytes = T.reinterpret(encoded, "uint8x256")
                                         if wide:
                                             T.simd.chistv2(frequency0, digit_bytes, mask8, bin=0)
                                             T.simd.chistv2(frequency1, digit_bytes, mask8, bin=1)
@@ -832,7 +832,7 @@ def build(specialization):
                 else:
                     with T.SimdVF():
                         mask = T.simd.pset(bit_width)
-                        threshold_key = T.reinterpret("uint32", prefix_ub[0])
+                        threshold_key = T.reinterpret(prefix_ub[0], "uint32")
                         rank_value = rank_ub[0]
                         masked = T.simd.vdup(
                             T.cast(negative_infinity_bits, bit_dtype), bit_dtype, mask
@@ -841,8 +841,8 @@ def build(specialization):
                         for vector_index in T.serial(chunk // vector_lanes):
                             if (piece < last_piece) | (vector_index < tail // vector_lanes):
                                 original = T.reinterpret(
-                                    bit_vector_dtype,
                                     T.simd.vld(values[vector_index * vector_lanes], dist="NORM"),
+                                    bit_vector_dtype,
                                 )
                                 filtered = original
                                 if rank_value < vocab:
@@ -904,7 +904,7 @@ def build(specialization):
                                         )
                                 T.simd.vsts(
                                     output_values[vector_index * vector_lanes],
-                                    T.reinterpret(value_vector_dtype, filtered),
+                                    T.reinterpret(filtered, value_vector_dtype),
                                     mask,
                                     dist=store_dist,
                                 )
@@ -930,7 +930,7 @@ def build(specialization):
                 with T.SimtVF(threads=threads):
                     prefix = T.alloc_fragment((1,), "uint32")
                     residual = T.alloc_fragment((1,), "int32")
-                    prefix[0] = T.reinterpret("uint32", PreviousPrefix[row]) & T.uint32(higher_mask)
+                    prefix[0] = T.reinterpret(PreviousPrefix[row], "uint32") & T.uint32(higher_mask)
                     residual[0] = PreviousRank[row]
                     if wide:
                         cumulative = T.alloc_fragment((radix,), "int32")
@@ -982,7 +982,7 @@ def build(specialization):
                                     prefix[0] = prefix[0] | (T.cast(digit, "uint32") << shift)
                                     found[0] = 1
                     for lane in T.Parallel(1):
-                        NextPrefix[row] = T.reinterpret("int32", prefix[lane])
+                        NextPrefix[row] = T.reinterpret(prefix[lane], "int32")
                         NextRank[row] = residual[lane]
 
         return merge_prefix
@@ -1005,7 +1005,7 @@ def build(specialization):
                             if K[row] >= vocab:
                                 Y[row, col] = X[row, col]
                             else:
-                                bits = T.cast(T.reinterpret(bit_dtype, X[row, col]), "uint32")
+                                bits = T.cast(T.reinterpret(X[row, col], bit_dtype), "uint32")
                                 magnitude = bits & T.uint32(magnitude_mask)
                                 key = T.if_then_else(
                                     magnitude == T.uint32(0),
@@ -1016,7 +1016,7 @@ def build(specialization):
                                         bits ^ T.uint32(sign_bit),
                                     ),
                                 )
-                                threshold_key = T.reinterpret("uint32", Threshold[row])
+                                threshold_key = T.reinterpret(Threshold[row], "uint32")
                                 if (magnitude <= T.uint32(infinity_magnitude)) & (
                                     key >= threshold_key
                                 ):
