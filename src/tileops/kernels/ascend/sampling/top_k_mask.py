@@ -1,8 +1,10 @@
-"""Streaming radix TopK mask for Ascend 950.
+"""Byte-histogram TopK mask for Ascend 950.
 
-One kernel handles every vocabulary and batch size. It selects the kth-largest
-threshold with a bitwise rank scan over the row, then writes the masked row in a
-second pass. No per-case kernel variants are generated.
+One kernel selects the kth-largest threshold with hardware byte histograms and
+writes the masked row. Wide rows are split into 8192-element chunks; every chunk
+contributes a 256-bin histogram, then the per-row histograms are merged and the
+selected byte is refined. The same kernel handles every vocab, batch and dtype in
+the supported range.
 """
 
 import functools
@@ -13,33 +15,71 @@ import tilelang.ascend.language as T
 import torch
 
 from tileops.backend import register_kernel_type
-from tileops.kernels.ascend.sampling.radix_reduce import _rank_tile
+from tileops.kernels.ascend.reduction.cumsum import _scan
 from tileops.kernels.kernel_base import Kernel
 from tileops.kernels.sampling.call_spec import SamplingCall, TopKMaskFwdInterface
 
 
-def _key(value, shift):
-    value = T.cast(value, "float32")
-    bits = T.reinterpret(T.if_then_else(value == 0, T.float32(0), value), "uint32")
-    return (
-        T.if_then_else(
-            T.isnan(value),
-            T.uint32(0xFFFFFFFF),
-            T.if_then_else(bits >> 31 != 0, ~bits, bits ^ T.uint32(0x80000000)),
-        )
-        >> shift
-    )
+@T.macro
+def _histogram(x, state, hist, chunk, count, dtype: str, shift: int):
+    with T.SimdVF():
+        full = T.simd.pset(32)
+        half_mask = T.simd.pset(16)
+        low = T.simd.alloc_local(1, "uint16")
+        high = T.simd.alloc_local(1, "uint16")
+        low[0] = T.simd.vdup(T.uint16(0), "uint16")
+        high[0] = T.simd.vdup(T.uint16(0), "uint16")
+        prefix = T.simd.vld(state[0], dist="BRC_B32")
+        for j in T.serial((count + 63) // 64):
+            valid = T.simd.update_mask(T.min(64, count - j * 64), 32)
+            value = (
+                T.simd.vld(x[j * 64])
+                if dtype == "float32"
+                else T.simd.vcvt(T.simd.vld(x[j * 64], dist="UNPK_B16"), "float32", part=0)
+            )
+            value = T.simd.vsel(
+                T.simd.vdup(T.float32(0), "float32"),
+                value,
+                T.simd.vcmps(value, T.float32(0), full, op="eq"),
+            )
+            raw = T.reinterpret(value, "uint32x64")
+            signed = T.reinterpret(value, "int32x64")
+            negative = T.simd.vcmps(signed, T.int32(0), full, op="lt")
+            flip = T.simd.vsel(
+                T.simd.vdup(T.uint32(0xFFFFFFFF), "uint32"),
+                T.simd.vdup(T.uint32(0x80000000), "uint32"),
+                negative,
+            )
+            key = T.simd.vxor(raw, flip, full)
+            absolute = T.simd.vand(raw, T.simd.vdup(T.uint32(0x7FFFFFFF), "uint32"), full)
+            key = T.simd.vsel(
+                T.simd.vdup(T.uint32(0xFFFFFFFF), "uint32"),
+                key,
+                T.simd.vcmps(absolute, T.uint32(0x7F800000), full, op="gt"),
+            )
+            if shift < 24:
+                upper = T.simd.vand(
+                    key,
+                    T.simd.vdup(T.uint32((0xFFFFFFFF << (shift + 8)) & 0xFFFFFFFF), "uint32"),
+                    full,
+                )
+                valid = T.simd.pand(valid, T.simd.vcmp(upper, prefix, full, op="eq"), full)
+            byte = T.simd.vand(
+                T.simd.vshrs(key, shift, full), T.simd.vdup(T.uint32(255), "uint32"), full
+            )
+            # A b32 predicate selects only byte zero of each reinterpreted word.
+            T.simd.dhistv2(low[0], T.reinterpret(byte, "uint8x256"), valid, bin=0)
+            T.simd.dhistv2(high[0], T.reinterpret(byte, "uint8x256"), valid, bin=1)
+        T.simd.vsts(hist[chunk, 0], low[0], half_mask, extent=128)
+        T.simd.vsts(hist[chunk, 128], high[0], half_mask, extent=128)
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=128)
 def _build(batch: int, vocab: int, dtype: str):
-    # A row tile plus the SIMD scratch must fit in UB for every supported dtype.
-    width = min(8192, max(64, tilelang.next_power_of_2(vocab)))
+    width = 8192
     chunks = (vocab + width - 1) // width
     blocks = min(batch, 64)
-    shift = 16 if dtype == "bfloat16" else 13 if dtype == "float16" else 0
-    bits = 32 - shift
-    max_key = 0xFFFFFFFF >> shift
+    shifts = (24, 16) if dtype == "bfloat16" else (24, 16, 8, 0)
 
     @T.prim_func
     def main(
@@ -50,25 +90,49 @@ def _build(batch: int, vocab: int, dtype: str):
         with T.Kernel(blocks) as bx:
             x = T.alloc_shared((width,), dtype)
             y = T.alloc_shared((width,), dtype)
+            hist = T.alloc_shared((chunks, 256), "uint16")
+            counts = T.alloc_shared((1, 256), "float32")
+            prefix = T.alloc_shared((1, 256), "float32")
+            carry = T.alloc_shared((1, 8), "float32")
+            state = T.alloc_shared((8,), "uint32")
             kval = T.alloc_shared((8,), "int32")
-            count_out = T.alloc_shared((8,), "int32")
             for r in T.serial(T.ceildiv(batch, blocks)):
                 row = r * blocks + bx
                 if row < batch:
                     T.copy(K[row : row + 1], kval[:1])
-                    cutoff = T.alloc_var("uint32", init=0)
+                    state[0] = T.uint32(0)
+                    state[1] = T.cast(kval[0], "uint32")
                     if kval[0] < vocab:
-                        for step in T.serial(bits):
-                            pivot = cutoff | (T.uint32(1) << (bits - 1 - step))
-                            rank = T.alloc_var("int32", init=0)
+                        for shift in shifts:
                             for chunk in T.serial(chunks):
                                 start = chunk * width
                                 count = T.min(width, vocab - start)
                                 T.copy(X[row, start : start + count], x[:count])
-                                _rank_tile(x, count_out, count, pivot, shift, dtype)
-                                rank = rank + count_out[0]
-                            if rank >= kval[0]:
-                                cutoff = pivot
+                                _histogram(x, state, hist, chunk, count, dtype, shift)
+                            with T.SimtVF(threads=256):
+                                totals = T.alloc_fragment((256,), "float32")
+                                for i in T.Parallel(256):
+                                    totals[i] = T.float32(0)
+                                    for part in T.serial(chunks):
+                                        totals[i] = totals[i] + T.cast(
+                                            hist[part, 255 - i], "float32"
+                                        )
+                                    counts[0, i] = totals[i]
+                            T.fill(carry, 0)
+                            _scan(counts, prefix, carry, 1, 256, "float32")
+                            with T.SimtVF(threads=256):
+                                index = T.alloc_reducer((1,), "int32", op="min")
+                                T.reducer_init(index)
+                                for i in T.Parallel(256):
+                                    if prefix[0, i] >= T.cast(state[1], "float32"):
+                                        T.reducer_update(index[0], i)
+                                found = T.alloc_fragment((1,), "int32")
+                                T.finalize_reducer(index, found)
+                                loc = T.min(found[0], 255)
+                                state[0] = state[0] | (T.cast(255 - loc, "uint32") << shift)
+                                state[1] = state[1] - T.cast(
+                                    prefix[0, loc] - counts[0, loc], "uint32"
+                                )
                     for chunk in T.serial(chunks):
                         start = chunk * width
                         count = T.min(width, vocab - start)
@@ -77,15 +141,26 @@ def _build(batch: int, vocab: int, dtype: str):
                             for i in T.Parallel(width):
                                 if i < count:
                                     value = T.cast(x[i], "float32")
-                                    keep = _key(value, shift) >= cutoff
-                                    keep = keep and (
-                                        kval[0] >= vocab
-                                        or (not T.isnan(value) and cutoff != T.uint32(max_key))
+                                    bits = T.reinterpret(
+                                        T.if_then_else(value == 0, T.float32(0), value),
+                                        "uint32",
+                                    )
+                                    key = T.if_then_else(
+                                        T.isnan(value),
+                                        T.uint32(0xFFFFFFFF),
+                                        T.if_then_else(
+                                            bits >> 31 != 0,
+                                            ~bits,
+                                            bits ^ T.uint32(0x80000000),
+                                        ),
+                                    )
+                                    keep = kval[0] >= vocab or (
+                                        key >= state[0]
+                                        and not T.isnan(value)
+                                        and state[0] < T.uint32(0xFFC00000)
                                     )
                                     y[i] = T.if_then_else(
-                                        keep,
-                                        x[i],
-                                        T.cast(-T.infinity("float32"), dtype),
+                                        keep, x[i], T.cast(-T.infinity("float32"), dtype)
                                     )
                         T.copy(y[:count], Y[row, start : start + count])
 
@@ -93,7 +168,7 @@ def _build(batch: int, vocab: int, dtype: str):
 
 
 class AscendTopKMaskKernel(Kernel, TopKMaskFwdInterface):
-    """General streaming radix TopK mask for float16, bfloat16 and float32."""
+    """General byte-histogram TopK mask for float16, bfloat16 and float32."""
 
     devices: ClassVar[frozenset[str]] = frozenset({"npu"})
 
