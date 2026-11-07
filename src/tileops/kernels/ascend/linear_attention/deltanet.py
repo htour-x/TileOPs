@@ -451,6 +451,40 @@ def _build_pack_grams(
     return tilelang.compile(pack_vectors, target="ascend", out_idx=[5, 6, 7, 8, 9, 10, 11])
 
 
+@T.macro
+def _forward_substitution(rhs, lower, chunk, panel, vectors):
+    # The lower coefficients are negated for fused subtraction into each row.
+    with T.SimdVF():
+        mask = T.simd.pset(32)
+        rows = T.simd.alloc_local(panel * vectors, "float32")
+        pivot = T.simd.alloc_local(vectors, "float32")
+        for p in range(chunk // panel):
+            for i in T.Unroll(panel, explicit=True):
+                for c in T.Unroll(vectors, explicit=True):
+                    rows[i * vectors + c] = T.simd.vld(rhs[p * panel + i, c * 64])
+            for j in range(p * panel):
+                for c in T.Unroll(vectors, explicit=True):
+                    pivot[c] = T.simd.vld(rhs[j, c * 64])
+                for i in T.Unroll(panel, explicit=True):
+                    coefficient = T.simd.vld(lower[p * panel + i, j], dist="BRC_B32")
+                    for c in T.Unroll(vectors, explicit=True):
+                        T.simd.vmula(rows[i * vectors + c], coefficient, pivot[c], mask)
+            for j in T.Unroll(panel, explicit=True):
+                for i in T.Unroll(panel, explicit=True):
+                    if i > j:
+                        coefficient = T.simd.vld(
+                            lower[p * panel + i, p * panel + j], dist="BRC_B32"
+                        )
+                        for c in T.Unroll(vectors, explicit=True):
+                            T.simd.vmula(
+                                rows[i * vectors + c], coefficient, rows[j * vectors + c], mask
+                            )
+            for i in T.Unroll(panel, explicit=True):
+                for c in T.Unroll(vectors, explicit=True):
+                    T.simd.vsts(rhs[p * panel + i, c * 64], rows[i * vectors + c], mask)
+            T.simd.mem_bar("VST_VLD")
+
+
 def _build_solve(slots, heads, dim_k, dim_v, chunk, max_blocks, threads, panel):
     features = dim_k + dim_v
     if features not in (128, 256):
@@ -487,50 +521,8 @@ def _build_solve(slots, heads, dim_k, dim_v, chunk, max_blocks, threads, panel):
                     T.copy(BP[slot, head, 0:chunk], beta_ub)
                     with T.SimtVF(threads=threads):
                         for i, j in T.Parallel(chunk, chunk):
-                            gram_ub[i, j] = gram_ub[i, j] * beta_ub[i]
-                    with T.SimdVF():
-                        mask = T.simd.pset(32)
-                        rows = T.simd.alloc_local(panel * vectors, "float32")
-                        current = T.simd.alloc_local(vectors, "float32")
-                        for p in range(chunk // panel):
-                            for r in T.Unroll(panel, explicit=True):
-                                for c in T.Unroll(vectors, explicit=True):
-                                    rows[r * vectors + c] = T.simd.vld(
-                                        rhs_ub[p * panel + r, c * 64]
-                                    )
-                            for j in T.Unroll(panel, explicit=True):
-                                for i in T.Unroll(panel, explicit=True):
-                                    if i > j:
-                                        coefficient = T.simd.vld(
-                                            gram_ub[p * panel + i, p * panel + j], dist="BRC_B32"
-                                        )
-                                        for c in T.Unroll(vectors, explicit=True):
-                                            product = T.simd.vmul(
-                                                coefficient, rows[j * vectors + c], mask
-                                            )
-                                            rows[i * vectors + c] = T.simd.vsub(
-                                                rows[i * vectors + c], product, mask
-                                            )
-                            for r in T.Unroll(panel, explicit=True):
-                                for c in T.Unroll(vectors, explicit=True):
-                                    T.simd.vsts(
-                                        rhs_ub[p * panel + r, c * 64], rows[r * vectors + c], mask
-                                    )
-                            for i in range((p + 1) * panel, chunk):
-                                for c in T.Unroll(vectors, explicit=True):
-                                    current[c] = T.simd.vld(rhs_ub[i, c * 64])
-                                for j in T.Unroll(panel, explicit=True):
-                                    trailing_coefficient = T.simd.vld(
-                                        gram_ub[i, p * panel + j], dist="BRC_B32"
-                                    )
-                                    for c in T.Unroll(vectors, explicit=True):
-                                        trailing_product = T.simd.vmul(
-                                            trailing_coefficient, rows[j * vectors + c], mask
-                                        )
-                                        current[c] = T.simd.vsub(current[c], trailing_product, mask)
-                                for c in T.Unroll(vectors, explicit=True):
-                                    T.simd.vsts(rhs_ub[i, c * 64], current[c], mask)
-                            T.simd.mem_bar("VST_VLD")
+                            gram_ub[i, j] = -(gram_ub[i, j] * beta_ub[i])
+                    _forward_substitution(rhs_ub, gram_ub, chunk, panel, vectors)
                     with T.SimtVF(threads=threads):
                         for t, i in T.Parallel(chunk, dim_k):
                             w_ub[t, i] = rhs_ub[t, i]
@@ -592,38 +584,10 @@ def _build_inverse_solve(slots, heads, dim_k, dim_v, chunk, max_blocks, threads,
                     T.copy(BP[slot, head, 0:chunk], beta_ub)
                     with T.SimtVF(threads=threads):
                         for i, j in T.Parallel(chunk, chunk):
-                            gram_ub[i, j] = gram_ub[i, j] * beta_ub[i]
+                            gram_ub[i, j] = -(gram_ub[i, j] * beta_ub[i])
                         for i, j in T.Parallel(chunk, inverse_width):
                             inverse_ub[i, j] = T.if_then_else(i == j, T.float32(1), T.float32(0))
-                    with T.SimdVF():
-                        mask = T.simd.pset(32)
-                        rows = T.simd.alloc_local(panel, "float32")
-                        current = T.simd.alloc_local(1, "float32")
-                        for p in range(chunk // panel):
-                            for r in T.Unroll(panel, explicit=True):
-                                rows[r] = T.simd.vld(inverse_ub[p * panel + r, 0])
-                            for j in T.Unroll(panel, explicit=True):
-                                for i in T.Unroll(panel, explicit=True):
-                                    if i > j:
-                                        coefficient = T.simd.vld(
-                                            gram_ub[p * panel + i, p * panel + j], dist="BRC_B32"
-                                        )
-                                        product = T.simd.vmul(coefficient, rows[j], mask)
-                                        rows[i] = T.simd.vsub(rows[i], product, mask)
-                            for r in T.Unroll(panel, explicit=True):
-                                T.simd.vsts(inverse_ub[p * panel + r, 0], rows[r], mask)
-                            for i in range((p + 1) * panel, chunk):
-                                current[0] = T.simd.vld(inverse_ub[i, 0])
-                                for j in T.Unroll(panel, explicit=True):
-                                    trailing_coefficient = T.simd.vld(
-                                        gram_ub[i, p * panel + j], dist="BRC_B32"
-                                    )
-                                    trailing_product = T.simd.vmul(
-                                        trailing_coefficient, rows[j], mask
-                                    )
-                                    current[0] = T.simd.vsub(current[0], trailing_product, mask)
-                                T.simd.vsts(inverse_ub[i, 0], current[0], mask)
-                            T.simd.mem_bar("VST_VLD")
+                    _forward_substitution(inverse_ub, gram_ub, chunk, panel, 1)
                     with T.SimtVF(threads=threads):
                         for i, j in T.Parallel(chunk, chunk):
                             inverse_compact_ub[i, j] = inverse_ub[i, j] * beta_ub[j]
