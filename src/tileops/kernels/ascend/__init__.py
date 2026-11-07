@@ -3,6 +3,7 @@
 from tileops.kernels.ascend import (
     elementwise,
     gemm,
+    linear_attention,
     mamba,
     moe,
     norm,
@@ -16,6 +17,7 @@ from tileops.kernels.ascend import (
 __all__ = [
     "elementwise",
     "gemm",
+    "linear_attention",
     "mamba",
     "moe",
     "pool",
