@@ -19,6 +19,14 @@ def _versions(*buffers):
     return dict.fromkeys(buffers, 1)
 
 
+def _unpack_token(src):
+    return T.simd.vcvt(T.simd.vld(src, dist="UNPK_B16"), "float32", part=0)
+
+
+def _token_lane(buf, row, col):
+    return buf[col] if row is None else buf[row, col]
+
+
 @T.macro
 def _collapse_decode_stripes(acc, c, stride, mask):
     left = T.simd.vadd(acc[c], acc[stride + c], mask)
@@ -27,26 +35,35 @@ def _collapse_decode_stripes(acc, c, stride, mask):
 
 
 @T.macro
-def _normalize_qk(qk, vectors, dtype, mask):
-    sums = T.simd.alloc_local(2, "float32")
-    inverse = T.simd.alloc_local(2, "float32")
-    one = T.simd.vdup(T.float32(1), "float32", mask)
-    for g in T.Unroll(2, explicit=True):
-        sums[g] = T.simd.vdup(T.float32(0), "float32", mask)
-    for col in T.Unroll(vectors, explicit=True):
+def _prepare_qk(raw, out, row, options, mask):
+    vectors, dtype, normalize, scale = options
+    qk = T.simd.alloc_local(2 * vectors, "float32")
+    for c in T.Unroll(vectors, explicit=True):
+        qk[c] = _unpack_token(_token_lane(raw[0], row, c * 64))
+        qk[vectors + c] = _unpack_token(_token_lane(raw[1], row, c * 64))
+    if normalize:
+        norms = T.simd.alloc_local(2, "float32")
+        one = T.simd.vdup(T.float32(1), "float32", mask)
         for g in T.Unroll(2, explicit=True):
-            x = qk[g * vectors + col]
-            sums[g] = T.simd.vadd(sums[g], T.simd.vmul(x, x, mask), mask)
-    for g in T.Unroll(2, explicit=True):
-        norm2 = T.simd.vdupv(T.simd.vcadd(sums[g], mask), mask)
-        root = T.simd.vsqrt(T.simd.vadds(norm2, T.float32(1e-6), mask), mask)
-        inverse[g] = T.simd.vdiv(one, root, mask, precision="exact")
-    for col in T.Unroll(vectors, explicit=True):
+            norms[g] = T.simd.vdup(T.float32(0), "float32", mask)
+        for c in T.Unroll(vectors, explicit=True):
+            for g in T.Unroll(2, explicit=True):
+                x = qk[g * vectors + c]
+                norms[g] = T.simd.vadd(norms[g], T.simd.vmul(x, x, mask), mask)
         for g in T.Unroll(2, explicit=True):
-            i = g * vectors + col
-            normalized = T.simd.vmul(qk[i], inverse[g], mask)
-            rounded = T.simd.vcvt(normalized, dtype, round="ROUND_R", part=0)
-            qk[i] = T.simd.vcvt(rounded, "float32", part=0)
+            norm2 = T.simd.vdupv(T.simd.vcadd(norms[g], mask), mask)
+            root = T.simd.vsqrt(T.simd.vadds(norm2, T.float32(1e-6), mask), mask)
+            norms[g] = T.simd.vdiv(one, root, mask, precision="ftz_true")
+        for c in T.Unroll(vectors, explicit=True):
+            for g in T.Unroll(2, explicit=True):
+                i = g * vectors + c
+                normalized = T.simd.vmul(qk[i], norms[g], mask)
+                rounded = T.simd.vcvt(normalized, dtype, round="ROUND_R", part=0)
+                qk[i] = T.simd.vcvt(rounded, "float32", part=0)
+    for c in T.Unroll(vectors, explicit=True):
+        scaled = T.simd.vmuls(qk[c], T.float32(scale), mask)
+        T.simd.vsts(_token_lane(out[0], row, c * 64), scaled, mask)
+        T.simd.vsts(_token_lane(out[1], row, c * 64), qk[vectors + c], mask)
 
 
 def _build_dense_decode(call, dtype):
@@ -55,6 +72,7 @@ def _build_dense_decode(call, dtype):
     jobs = batch * heads
     blocks = min(_VECTOR_BLOCKS, jobs)
     key_vectors, value_vectors = dim_k // 64, dim_v // 64
+    qk_options = (key_vectors, dtype, normalize, scale)
 
     @T.prim_func
     def main(
@@ -89,18 +107,7 @@ def _build_dense_decode(call, dtype):
                     T.copy(Initial[sequence, head, 0:dim_k, 0:dim_v], state_kv)
                 with T.SimdVF():
                     mask = T.simd.pset(32)
-                    qk = T.simd.alloc_local(2 * key_vectors, "float32")
-                    for c in T.Unroll(key_vectors, explicit=True):
-                        qk[c] = T.simd.vcvt(T.simd.vld(q_raw[c * 64], dist="UNPK_B16"), "float32")
-                        qk[key_vectors + c] = T.simd.vcvt(
-                            T.simd.vld(k_raw[c * 64], dist="UNPK_B16"), "float32"
-                        )
-                    if normalize:
-                        _normalize_qk(qk, key_vectors, dtype, mask)
-                    for c in T.Unroll(key_vectors, explicit=True):
-                        scaled = T.simd.vmuls(qk[c], T.float32(scale), mask)
-                        T.simd.vsts(q_f32[c * 64], scaled, mask)
-                        T.simd.vsts(k_f32[c * 64], qk[key_vectors + c], mask)
+                    _prepare_qk((q_raw, k_raw), (q_f32, k_f32), None, qk_options, mask)
                 with T.SimdVF():
                     mask = T.simd.pset(32)
                     delta = T.simd.alloc_local(value_vectors, "float32")
@@ -122,9 +129,7 @@ def _build_dense_decode(call, dtype):
                                     )
                     beta_reg = T.simd.vcvt(T.simd.vld(beta_raw[0], dist="BRC_B16"), "float32")
                     for c in T.Unroll(value_vectors, explicit=True):
-                        value_reg = T.simd.vcvt(
-                            T.simd.vld(v_raw[c * 64], dist="UNPK_B16"), "float32"
-                        )
+                        value_reg = _unpack_token(v_raw[c * 64])
                         if has_initial:
                             _collapse_decode_stripes(prediction, c, value_vectors, mask)
                             value_reg = T.simd.vsub(value_reg, prediction[c], mask)
@@ -184,6 +189,7 @@ def _build_pack_grams(call, dtype, slots, hf32):
     search_steps = (num_sequences - 1).bit_length()
     prefix = (slots, heads, chunk)
     rows, vectors = chunk // 2, dim // 64
+    qk_options = (vectors, dtype, normalize, scale)
 
     @T.prim_func
     def pack_grams(
@@ -244,9 +250,8 @@ def _build_pack_grams(call, dtype, slots, hf32):
                 if live > 0:
                     begin = token + row
                     end = begin + live
-                    T.copy(Q[batch_index, begin:end, head, 0:dim], q_raw[0:live, 0:dim])
-                    T.copy(K[batch_index, begin:end, head, 0:dim], k_raw[0:live, 0:dim])
-                    T.copy(V[batch_index, begin:end, head, 0:dim], v_raw[0:live, 0:dim])
+                    for src, dst in zip((Q, K, V), (q_raw, k_raw, v_raw), strict=True):
+                        T.copy(src[batch_index, begin:end, head, 0:dim], dst[0:live, 0:dim])
                     T.copy(Beta[batch_index, begin:end, 0:heads], b_raw[0:live, 0:heads])
                 with T.SimtVF(threads=min(_THREADS, dim)):
                     for t in T.Parallel(rows):
@@ -255,30 +260,15 @@ def _build_pack_grams(call, dtype, slots, hf32):
                         )
                 with T.SimdVF():
                     mask = T.simd.pset(32)
-                    qk = T.simd.alloc_local(2 * vectors, "float32")
                     for t in range(live):
+                        _prepare_qk((q_raw, k_raw), (q_ub, k_ub), t, qk_options, mask)
                         for c in T.Unroll(vectors, explicit=True):
-                            q_in = T.simd.vld(q_raw[t, c * 64], dist="UNPK_B16")
-                            k_in = T.simd.vld(k_raw[t, c * 64], dist="UNPK_B16")
-                            qk[c] = T.simd.vcvt(q_in, "float32", part=0)
-                            qk[vectors + c] = T.simd.vcvt(k_in, "float32", part=0)
-                        if normalize:
-                            _normalize_qk(qk, vectors, dtype, mask)
-                        for c in T.Unroll(vectors, explicit=True):
-                            scaled = T.simd.vmuls(qk[c], T.float32(scale), mask)
-                            T.simd.vsts(q_ub[t, c * 64], scaled, mask)
-                            T.simd.vsts(k_ub[t, c * 64], qk[vectors + c], mask)
-                        for c in T.Unroll(vectors, explicit=True):
-                            v_in = T.simd.vld(v_raw[t, c * 64], dist="UNPK_B16")
-                            widened = T.simd.vcvt(v_in, "float32", part=0)
-                            T.simd.vsts(v_ub[t, c * 64], widened, mask)
+                            T.simd.vsts(v_ub[t, c * 64], _unpack_token(v_raw[t, c * 64]), mask)
                     zero = T.simd.vdup(T.float32(0), "float32", mask)
                     for t in range(live, rows):
                         for c in T.Unroll(vectors, explicit=True):
-                            T.simd.vsts(q_ub[t, c * 64], zero, mask)
-                            T.simd.vsts(k_ub[t, c * 64], zero, mask)
-                        for c in T.Unroll(vectors, explicit=True):
-                            T.simd.vsts(v_ub[t, c * 64], zero, mask)
+                            for dst in (q_ub, k_ub, v_ub):
+                                T.simd.vsts(dst[t, c * 64], zero, mask)
                 T.dual_copy(k_ub, kq_l1[0:chunk, 0:dim])
                 T.dual_copy(q_ub, kq_l1[chunk : 2 * chunk, 0:dim])
                 T.copy(kq_l1, left)
@@ -294,11 +284,12 @@ def _build_pack_grams(call, dtype, slots, hf32):
 
 
 @T.macro
-def _forward_substitution(rhs, lower, beta, vectors, weight_rhs):
+def _forward_substitution(rhs, lower, beta, width, weight_rhs):
     # Negated lower coefficients let the SIMD FMA subtract each prior pivot.
-    panel = _SOLVE_PANEL
+    panel, vectors = _SOLVE_PANEL, (width + 63) // 64
+    lanes = min(width, 64)
     with T.SimdVF():
-        mask = T.simd.pset(32)
+        mask = T.simd.pset(32, "PAT_VL32" if lanes == 32 else "PAT_ALL")
         rows = T.simd.alloc_local(panel * vectors, "float32")
         pivot = T.simd.alloc_local(vectors, "float32")
         for p in range(_CHUNK // panel):
@@ -326,14 +317,14 @@ def _forward_substitution(rhs, lower, beta, vectors, weight_rhs):
                             T.simd.vmula(rows[i * vectors + c], coeff, rows[j * vectors + c], mask)
             for i in T.Unroll(panel, explicit=True):
                 for c in T.Unroll(vectors, explicit=True):
-                    T.simd.vsts(rhs[base + i, c * 64], rows[i * vectors + c], mask)
+                    T.simd.vsts(rhs[base + i, c * 64], rows[i * vectors + c], mask, extent=lanes)
             T.simd.mem_bar("VST_VLD")
 
 
 def _build_solve(slots, heads, dim, hf32):
     chunk = _CHUNK
     inverse = hf32 is not None
-    width = 64 if inverse else 2 * dim
+    width = chunk if inverse else 2 * dim
     jobs = slots * heads
     blocks = min(_CUBE_BLOCKS if inverse else _VECTOR_BLOCKS, jobs)
     prefix = (slots, heads)
@@ -347,7 +338,8 @@ def _build_solve(slots, heads, dim, hf32):
         UT: T.Tensor((*prefix, dim, chunk), "float32"),
     ):
         with T.Kernel(blocks) as block:
-            rhs = T.alloc_shared((chunk, width), "float32")
+            # Inverse rows occupy half a SIMD register. Pad the final load.
+            rhs = T.alloc_shared((chunk + int(inverse), width), "float32")
             gram = T.alloc_shared((chunk, chunk), "float32")
             beta = T.alloc_shared((chunk,), "float32")
             if inverse:
@@ -372,14 +364,11 @@ def _build_solve(slots, heads, dim, hf32):
                     for i, j in T.Parallel(chunk, chunk):
                         gram[i, j] = -(gram[i, j] * beta[i])
                     if inverse:
-                        for i, j in T.Parallel(chunk, width):
-                            rhs[i, j] = T.if_then_else(i == j, T.float32(1), T.float32(0))
-                _forward_substitution(rhs, gram, beta, width // 64, not inverse)
+                        for i, j in T.Parallel(chunk + 1, chunk):
+                            rhs[i, j] = T.if_then_else(i == j, beta[j], T.float32(0))
+                _forward_substitution(rhs, gram, beta, width, not inverse)
                 if inverse:
-                    with T.SimtVF(threads=_THREADS):
-                        for i, j in T.Parallel(chunk, chunk):
-                            gram[i, j] = rhs[i, j] * beta[j]
-                    T.copy(gram, inv_l1)
+                    T.copy(rhs[0:chunk, 0:chunk], inv_l1)
                     T.copy(KV[slot, head, 0:chunk, 0:dim], rhs_l1, transpose=True)
                     T.gemm(inv_l1, rhs_l1, w_acc, transpose_B=True, clear_accum=True)
                     T.copy(w_acc, W[slot, head, 0:chunk, 0:dim])
@@ -572,37 +561,33 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
             raise NotImplementedError(reason)
         super().__init__(device_index=call.device.index if call.device is not None else None)
         self.dtype = call.dtype
-        self._has_initial = call.has_initial_state
-        self._packed = call.varlen
-        self._decode = call.seq_len == 1 and not call.varlen
-        batch, seq_len, sequences = call.batch, call.seq_len, call.num_sequences
-        heads, dim = call.heads, call.dim_k
-        self._state_shape = (sequences, heads, dim, dim)
-
-        if self._decode:
+        self._call = call
+        self._state_shape = (call.num_sequences, call.heads, call.dim_k, call.dim_v)
+        dtype = self.dtype_str
+        if call.seq_len == 1 and not call.varlen:
             self.config.update(
                 max_blocks=_VECTOR_BLOCKS,
                 state_layout="KV",
                 reduction_stripes=4,
                 value_vector_width=64,
             )
-            self._compiled_fn = _build_dense_decode(call, self.dtype_str)
+            self._compiled_fn = _build_dense_decode(call, dtype)
             return
 
-        dense_chunks = (seq_len + _CHUNK - 1) // _CHUNK
+        sequences, heads, dim, _ = self._state_shape
+        dense_chunks = (call.seq_len + _CHUNK - 1) // _CHUNK
         # Packed starts reserve one slot per sequence so partial chunks cannot overlap.
-        slots = dense_chunks + sequences - 1 if self._packed else batch * dense_chunks
+        slots = dense_chunks + sequences - 1 if call.varlen else call.batch * dense_chunks
         if slots > 2147483647:
             raise NotImplementedError("requires chunk indices representable by int32")
         inverse_solve = dim == 128
         hf32 = "nearest_even" if inverse_solve else None
         solve_blocks = _CUBE_BLOCKS if inverse_solve else _VECTOR_BLOCKS
-        aligned_dense = not self._packed and seq_len % _CHUNK == 0
-        if dim == 64:
-            # Split independent value columns while there are unoccupied Cube cores.
-            value_tile = 32 if sequences * heads < _CUBE_BLOCKS else 64
-        else:
-            value_tile = dim if aligned_dense else dim // 2
+        aligned = not call.varlen and call.seq_len % _CHUNK == 0
+        # A packed batch can be dominated by a single sequence.
+        jobs = heads if call.varlen else sequences * heads
+        wide = jobs >= _CUBE_BLOCKS or (dim == 128 and aligned)
+        value_tile = dim if wide else dim // 2
         self.config.update(
             chunk=_CHUNK,
             cube_blocks=_CUBE_BLOCKS,
@@ -614,11 +599,9 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
             state_value_tile=value_tile,
             hf32=hf32,
         )
-        self._pack = _build_pack_grams(call, self.dtype_str, slots, hf32)
+        self._pack = _build_pack_grams(call, dtype, slots, hf32)
         self._solve = _build_solve(slots, heads, dim, hf32)
-        self._states_project = _build_fused_states_project(
-            call, self.dtype_str, slots, value_tile, hf32
-        )
+        self._states_project = _build_fused_states_project(call, dtype, slots, value_tile, hf32)
 
     def forward(
         self,
@@ -630,17 +613,17 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
         cu_seqlens: torch.Tensor | None = None,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (initial_state is not None) != self._has_initial:
+        call = self._call
+        if (initial_state is not None) != call.has_initial_state:
             raise ValueError("initial_state presence differs from the specialized call")
-        if (cu_seqlens is not None) != self._packed:
+        if (cu_seqlens is not None) != call.varlen:
             raise ValueError("cu_seqlens presence differs from the specialized call")
         if initial_state is None:
-            initial_state = torch.empty(self._state_shape, dtype=torch.float32, device=q.device)
-        if self._decode:
+            initial_state = q.new_empty(self._state_shape, dtype=torch.float32)
+        if call.seq_len == 1 and not call.varlen:
             return tuple(self._compiled_fn(q, k, v, beta, initial_state))
         if cu_seqlens is None:
-            offsets_shape = (self._state_shape[0] + 1,)
-            cu_seqlens = torch.empty(offsets_shape, dtype=torch.int64, device=q.device)
+            cu_seqlens = q.new_empty((call.num_sequences + 1,), dtype=torch.int64)
         # Device offsets are authoritative and all workspaces belong to this invocation.
         qp, kv, bp, gram_qk = self._pack(q, k, v, beta, cu_seqlens)
         w, ut = self._solve(kv, gram_qk, bp)
