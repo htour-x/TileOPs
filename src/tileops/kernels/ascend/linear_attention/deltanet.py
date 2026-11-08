@@ -284,49 +284,36 @@ def _build_pack_grams(call, dtype, slots, hf32):
 
 
 @T.macro
-def _forward_substitution(rhs, lower, beta, width, weight_rhs):
-    # Negated lower coefficients let the SIMD FMA subtract each prior pivot.
-    panel, vectors = _SOLVE_PANEL, (width + 63) // 64
-    lanes = min(width, 64)
+def _weighted_inverse(rhs, lower):
+    # The inverse fits in one SIMD vector per row. Update an eight-row panel at a time.
+    panel = _SOLVE_PANEL
     with T.SimdVF():
-        mask = T.simd.pset(32, "PAT_VL32" if lanes == 32 else "PAT_ALL")
-        rows = T.simd.alloc_local(panel * vectors, "float32")
-        pivot = T.simd.alloc_local(vectors, "float32")
+        mask = T.simd.pset(32, "PAT_VL32")
+        rows = T.simd.alloc_local(panel, "float32")
         for p in range(_CHUNK // panel):
             base = p * panel
             for i in T.Unroll(panel, explicit=True):
-                if weight_rhs:
-                    beta_reg = T.simd.vld(beta[base + i], dist="BRC_B32")
-                for c in T.Unroll(vectors, explicit=True):
-                    row = T.simd.vld(rhs[base + i, c * 64])
-                    if weight_rhs:
-                        row = T.simd.vmul(row, beta_reg, mask)
-                    rows[i * vectors + c] = row
+                rows[i] = T.simd.vld(rhs[base + i, 0])
             for j in range(base):
-                for c in T.Unroll(vectors, explicit=True):
-                    pivot[c] = T.simd.vld(rhs[j, c * 64])
+                pivot = T.simd.vld(rhs[j, 0])
                 for i in T.Unroll(panel, explicit=True):
                     coeff = T.simd.vld(lower[base + i, j], dist="BRC_B32")
-                    for c in T.Unroll(vectors, explicit=True):
-                        T.simd.vmula(rows[i * vectors + c], coeff, pivot[c], mask)
+                    T.simd.vmula(rows[i], coeff, pivot, mask)
             for j in T.Unroll(panel, explicit=True):
                 for i in T.Unroll(panel, explicit=True):
                     if i > j:
                         coeff = T.simd.vld(lower[base + i, base + j], dist="BRC_B32")
-                        for c in T.Unroll(vectors, explicit=True):
-                            T.simd.vmula(rows[i * vectors + c], coeff, rows[j * vectors + c], mask)
+                        T.simd.vmula(rows[i], coeff, rows[j], mask)
             for i in T.Unroll(panel, explicit=True):
-                for c in T.Unroll(vectors, explicit=True):
-                    T.simd.vsts(rhs[base + i, c * 64], rows[i * vectors + c], mask, extent=lanes)
+                T.simd.vsts(rhs[base + i, 0], rows[i], mask, extent=_CHUNK)
             T.simd.mem_bar("VST_VLD")
 
 
 def _build_solve(slots, heads, dim, hf32):
     chunk = _CHUNK
-    inverse = hf32 is not None
-    width = chunk if inverse else 2 * dim
     jobs = slots * heads
-    blocks = min(_CUBE_BLOCKS if inverse else _VECTOR_BLOCKS, jobs)
+    pairs = (jobs + 1) // 2
+    blocks = min(_CUBE_BLOCKS, pairs)
     prefix = (slots, heads)
 
     @T.prim_func
@@ -334,55 +321,44 @@ def _build_solve(slots, heads, dim, hf32):
         KV: T.Tensor((*prefix, chunk, 2 * dim), "float32"),
         GramQK: T.Tensor((*prefix, 2 * chunk, chunk), "float32"),
         BP: T.Tensor((*prefix, chunk), "float32"),
-        W: T.Tensor((*prefix, chunk, dim), "float32"),
-        UT: T.Tensor((*prefix, dim, chunk), "float32"),
+        Solved: T.Tensor((*prefix, 2 * dim, chunk), "float32"),
     ):
-        with T.Kernel(blocks) as block:
-            # Inverse rows occupy half a SIMD register. Pad the final load.
-            rhs = T.alloc_shared((chunk + int(inverse), width), "float32")
+        with T.MixedKernel(blocks) as (block, sid):
+            T.set_hf32_mode(hf32)
+            # Pad the final inverse row for a full-width SIMD load.
+            rhs = T.alloc_shared((chunk + 1, chunk), "float32")
             gram = T.alloc_shared((chunk, chunk), "float32")
             beta = T.alloc_shared((chunk,), "float32")
-            if inverse:
-                T.set_hf32_mode(hf32)
-                inv_l1 = T.alloc_l1((chunk, chunk), "float32")
-                rhs_l1 = T.alloc_l1((dim, chunk), "float32")
-                w_acc = T.alloc_l0c((chunk, dim), "float32")
-                ut_acc = T.alloc_l0c((dim, chunk), "float32")
-                T.annotate_buffer_versions(
-                    _versions(rhs, gram, beta, inv_l1, rhs_l1, w_acc, ut_acc)
-                )
-            else:
-                ut_ub = T.alloc_shared((dim, chunk), "float32")
-                T.annotate_buffer_versions(_versions(rhs, gram, beta, ut_ub))
-            for job in T.serial(block, jobs, blocks):
+            inv_l1 = T.alloc_l1((2 * chunk, chunk), "float32")
+            rhs_l1 = T.alloc_l1((2 * dim, chunk), "float32")
+            inv_b = T.alloc_l0b((chunk, chunk), "float32")
+            rhs_a = T.alloc_l0a((2 * dim, chunk), "float32")
+            result = T.alloc_l0c((2 * dim, chunk), "float32")
+            cube_tiles = (inv_l1, rhs_l1, rhs_a, inv_b, result)
+            T.annotate_buffer_versions(_versions(rhs, gram, beta, *cube_tiles))
+            for pair in T.serial(block, pairs, blocks):
+                # Both AIVs participate even when the final pair has just one chunk.
+                job = T.min(pair * 2 + sid, jobs - 1)
                 slot, head = job // heads, job % heads
-                if not inverse:
-                    T.copy(KV[slot, head, 0:chunk, 0 : 2 * dim], rhs)
                 T.copy(GramQK[slot, head, 0:chunk, 0:chunk], gram)
                 T.copy(BP[slot, head, 0:chunk], beta)
                 with T.SimtVF(threads=_THREADS):
                     for i, j in T.Parallel(chunk, chunk):
                         gram[i, j] = -(gram[i, j] * beta[i])
-                    if inverse:
-                        for i, j in T.Parallel(chunk + 1, chunk):
-                            rhs[i, j] = T.if_then_else(i == j, beta[j], T.float32(0))
-                _forward_substitution(rhs, gram, beta, width, not inverse)
-                if inverse:
-                    T.copy(rhs[0:chunk, 0:chunk], inv_l1)
-                    T.copy(KV[slot, head, 0:chunk, 0:dim], rhs_l1, transpose=True)
-                    T.gemm(inv_l1, rhs_l1, w_acc, transpose_B=True, clear_accum=True)
-                    T.copy(w_acc, W[slot, head, 0:chunk, 0:dim])
-                    T.copy(KV[slot, head, 0:chunk, dim : 2 * dim], rhs_l1, transpose=True)
-                    T.gemm(rhs_l1, inv_l1, ut_acc, transpose_B=True, clear_accum=True)
-                    T.copy(ut_acc, UT[slot, head, 0:dim, 0:chunk])
-                else:
-                    T.copy(rhs[0:chunk, 0:dim], W[slot, head, 0:chunk, 0:dim])
-                    with T.SimtVF(threads=_THREADS):
-                        for j, t in T.Parallel(dim, chunk):
-                            ut_ub[j, t] = rhs[t, dim + j]
-                    T.copy(ut_ub, UT[slot, head, 0:dim, 0:chunk])
+                    for i, j in T.Parallel(chunk + 1, chunk):
+                        rhs[i, j] = T.if_then_else(i == j, beta[j], T.float32(0))
+                _weighted_inverse(rhs, gram)
+                T.dual_copy(rhs[0:chunk, 0:chunk], inv_l1)
+                for cube_job in T.serial(pair * 2, T.min(pair * 2 + 2, jobs)):
+                    cube_slot, cube_head = cube_job // heads, cube_job % heads
+                    row = (cube_job % 2) * chunk
+                    T.copy(inv_l1[row : row + chunk, 0:chunk], inv_b)
+                    T.copy(KV[cube_slot, cube_head, 0:chunk, 0 : 2 * dim], rhs_l1, transpose=True)
+                    T.copy(rhs_l1, rhs_a)
+                    T.gemm(rhs_a, inv_b, result, transpose_B=True, clear_accum=True)
+                    T.copy(result, Solved[cube_slot, cube_head, 0 : 2 * dim, 0:chunk])
 
-    return tilelang.compile(main, target="ascend", out_idx=[3, 4])
+    return tilelang.compile(main, target="ascend", out_idx=[3])
 
 
 @T.macro
@@ -411,8 +387,7 @@ def _build_fused_states_project(call, dtype, slots, value_tile, hf32):
 
     @T.prim_func
     def main(
-        W: T.Tensor((*prefix, chunk, dim), "float32"),
-        UT: T.Tensor((*prefix, dim, chunk), "float32"),
+        Solved: T.Tensor((*prefix, 2 * dim, chunk), "float32"),
         KP: T.Tensor((*prefix, chunk, 2 * dim), "float32"),
         QP: T.Tensor((*prefix, chunk, dim), "float32"),
         GramQK: T.Tensor((*prefix, 2 * chunk, chunk), "float32"),
@@ -460,24 +435,20 @@ def _build_fused_states_project(call, dtype, slots, value_tile, hf32):
                 sequence = job // (heads * value_tiles)
                 head = job // value_tiles % heads
                 value = (job % value_tiles) * value_tile
+                v_end = T.meta_var(value + value_tile)
                 if packed:
-                    batch_index = 0
+                    batch = 0
                     first = T.cast(Offsets[sequence], "int32")
                     end = T.cast(Offsets[sequence + 1], "int32")
                     first_slot = first // chunk + sequence
-                    length = T.cast(end - first, "int64")
-                    end_slot = first_slot + T.cast(T.ceildiv(length, chunk), "int32")
+                    count = T.cast(T.ceildiv(T.cast(end - first, "int64"), chunk), "int32")
                 else:
-                    batch_index = sequence
+                    batch = sequence
                     first, end = 0, seq_len
                     first_slot = sequence * dense_chunks
-                    end_slot = first_slot + dense_chunks
+                    count = dense_chunks
                 if has_initial:
-                    T.copy(
-                        Initial[sequence, head, 0:dim, value : value + value_tile],
-                        state_l1,
-                        transpose=True,
-                    )
+                    T.copy(Initial[sequence, head, 0:dim, value:v_end], state_l1, transpose=True)
                     _staged_gemm(state_l1, identity_l1, left, right, state, True)
                     T.dual_copy(state, state_ub)
                 else:
@@ -487,14 +458,14 @@ def _build_fused_states_project(call, dtype, slots, value_tile, hf32):
                         for j in range(half_v):
                             for c in T.Unroll(dim // 64, explicit=True):
                                 T.simd.vsts(state_ub[j, c * 64], zero, mask)
-                for slot in T.serial(first_slot, end_slot):
+                for slot in T.serial(first_slot, first_slot + count):
                     T.dual_copy(state_ub, state_l1)
-                    T.copy(W[slot, head, 0:chunk, 0:dim], w_l1)
+                    T.copy(Solved[slot, head, 0:dim, 0:chunk], w_l1, transpose=True)
                     T.copy(QP[slot, head, 0:chunk, 0:dim], q_l1)
                     _staged_gemm(state_l1, w_l1, left, right, predicted, True)
                     T.dual_copy(predicted, pred_ub)
                     _staged_gemm(q_l1, state_l1, left, right, output, True)
-                    T.dual_copy(UT[slot, head, value : value + value_tile, 0:chunk], u_ub)
+                    T.dual_copy(Solved[slot, head, dim + value : dim + v_end, 0:chunk], u_ub)
                     with T.SimdVF():
                         mask = T.simd.pset(32)
                         for x in range(half_v * chunk // 64):
@@ -512,16 +483,12 @@ def _build_fused_states_project(call, dtype, slots, value_tile, hf32):
                     _staged_gemm(g_l1, d_l1, left, right, output, False)
                     token = first + (slot - first_slot) * chunk
                     valid = chunk if aligned_dense else T.min(chunk, end - token)
-                    # The destination clips rows while the source keeps its full pitch.
-                    T.copy(
-                        output,
-                        OP[batch_index, token : token + valid, head, value : value + value_tile],
-                    )
+                    T.copy(output, OP[batch, token : token + valid, head, value:v_end])
                     T.copy(KP[slot, head, 0:chunk, 0:dim], kt_l1, transpose=True)
                     clear = False if has_initial else slot == first_slot
                     _staged_gemm(d_l1, kt_l1, left, right, state, clear)
                     T.dual_copy(state, state_ub)
-                empty_initial = first_slot == end_slot if packed and has_initial else False
+                empty_initial = count == 0 if packed and has_initial else False
                 if empty_initial:
                     local = value + sid * half_v
                     T.copy(Initial[sequence, head, 0:dim, local : local + half_v], final_ub)
@@ -529,9 +496,9 @@ def _build_fused_states_project(call, dtype, slots, value_tile, hf32):
                     with T.SimtVF(threads=_THREADS):
                         for i, j in T.Parallel(dim, half_v):
                             final_ub[i, j] = state_ub[j, i]
-                T.dual_copy(final_ub, Final[sequence, head, 0:dim, value : value + value_tile])
+                T.dual_copy(final_ub, Final[sequence, head, 0:dim, value:v_end])
 
-    return tilelang.compile(main, target="ascend", out_idx=[7, 8])
+    return tilelang.compile(main, target="ascend", out_idx=[6, 7])
 
 
 class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
@@ -580,9 +547,7 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
         slots = dense_chunks + sequences - 1 if call.varlen else call.batch * dense_chunks
         if slots > 2147483647:
             raise NotImplementedError("requires chunk indices representable by int32")
-        inverse_solve = dim == 128
-        hf32 = "nearest_even" if inverse_solve else None
-        solve_blocks = _CUBE_BLOCKS if inverse_solve else _VECTOR_BLOCKS
+        hf32 = "nearest_even" if dim == 128 else None
         aligned = not call.varlen and call.seq_len % _CHUNK == 0
         # A packed batch can be dominated by a single sequence.
         jobs = heads if call.varlen else sequences * heads
@@ -592,10 +557,10 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
             chunk=_CHUNK,
             cube_blocks=_CUBE_BLOCKS,
             threads=_THREADS,
-            solve_blocks=solve_blocks,
+            solve_blocks=_CUBE_BLOCKS,
             solve_threads=_THREADS,
             solve_panel=_SOLVE_PANEL,
-            solve_algorithm="fused_inverse_direct_gemm" if inverse_solve else "direct_panel",
+            solve_algorithm="paired_inverse_cube",
             state_value_tile=value_tile,
             hf32=hf32,
         )
@@ -626,8 +591,8 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
             cu_seqlens = q.new_empty((call.num_sequences + 1,), dtype=torch.int64)
         # Device offsets are authoritative and all workspaces belong to this invocation.
         qp, kv, bp, gram_qk = self._pack(q, k, v, beta, cu_seqlens)
-        w, ut = self._solve(kv, gram_qk, bp)
-        return self._states_project(w, ut, kv, qp, gram_qk, initial_state, cu_seqlens)
+        solved = self._solve(kv, gram_qk, bp)
+        return self._states_project(solved, kv, qp, gram_qk, initial_state, cu_seqlens)
 
 
 tileops.backend.register_kernel_type("DeltaNetFwdOp", "ascend", AscendDeltaNetChunkedKernel)
