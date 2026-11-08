@@ -24,6 +24,13 @@ _DECODE_THREADS = 128
 _K128_HF32 = "nearest_even"
 
 
+@T.macro
+def _collapse_decode_stripes(acc, c, stride, mask):
+    left = T.simd.vadd(acc[c], acc[stride + c], mask)
+    right = T.simd.vadd(acc[2 * stride + c], acc[3 * stride + c], mask)
+    acc[c] = T.simd.vadd(left, right, mask)
+
+
 def _build_dense_decode(
     batch, heads, dim_k, dim_v, dtype, scale, normalize, has_initial, max_blocks, simt_threads
 ):
@@ -51,9 +58,6 @@ def _build_dense_decode(
             beta_raw = T.alloc_shared((16,), dtype)
             q_f32 = T.alloc_shared((dim_k,), "float32")
             k_f32 = T.alloc_shared((dim_k,), "float32")
-            v_f32 = T.alloc_shared((dim_v,), "float32")
-            beta_f32 = T.alloc_shared((8,), "float32")
-            output_f32 = T.alloc_shared((dim_v,), "float32")
             output_ub = T.alloc_shared((dim_v,), dtype)
             T.annotate_buffer_versions(
                 {
@@ -64,9 +68,6 @@ def _build_dense_decode(
                     beta_raw: 1,
                     q_f32: 1,
                     k_f32: 1,
-                    v_f32: 1,
-                    beta_f32: 1,
-                    output_f32: 1,
                     output_ub: 1,
                 }
             )
@@ -108,25 +109,17 @@ def _build_dense_decode(
                         for i in T.Parallel(dim_k, coalesced_width=T.int32(1)):
                             q_f32[i] = q_frag[i] * T.float32(scale)
                             k_f32[i] = k_frag[i]
-                        for j in T.Parallel(dim_v):
-                            v_f32[j] = T.cast(v_raw[j], "float32")
-                        for r in T.Parallel(1):
-                            beta_f32[r] = T.cast(beta_raw[r], "float32")
+
                     with T.SimdVF():
                         mask = T.simd.pset(32)
-                        prediction = T.simd.alloc_local(4 * value_vectors, "float32")
-                        result = T.simd.alloc_local(4 * value_vectors, "float32")
                         delta = T.simd.alloc_local(value_vectors, "float32")
-                        for r in T.Unroll(4, explicit=True):
-                            for c in T.Unroll(value_vectors, explicit=True):
-                                result[r * value_vectors + c] = T.simd.vdup(
-                                    T.float32(0), "float32", mask
-                                )
-                                if has_initial:
-                                    prediction[r * value_vectors + c] = T.simd.vdup(
-                                        T.float32(0), "float32", mask
-                                    )
                         if has_initial:
+                            prediction = T.simd.alloc_local(4 * value_vectors, "float32")
+                            result = T.simd.alloc_local(4 * value_vectors, "float32")
+                            zero = T.simd.vdup(T.float32(0), "float32", mask)
+                            for i in T.Unroll(4 * value_vectors, explicit=True):
+                                prediction[i] = zero
+                                result[i] = zero
                             for g in range(dim_k // 4):
                                 for r in T.Unroll(4, explicit=True):
                                     key_reg = T.simd.vld(k_f32[g * 4 + r], dist="BRC_B32")
@@ -136,27 +129,22 @@ def _build_dense_decode(
                                         prediction[r * value_vectors + c] = T.simd.vadd(
                                             prediction[r * value_vectors + c], product, mask
                                         )
-                        beta_reg = T.simd.vld(beta_f32[0], dist="BRC_B32")
+                        beta_reg = T.simd.vcvt(T.simd.vld(beta_raw[0], dist="BRC_B16"), "float32")
                         for c in T.Unroll(value_vectors, explicit=True):
-                            value_reg = T.simd.vld(v_f32[c * 64])
+                            value_reg = T.simd.vcvt(
+                                T.simd.vld(v_raw[c * 64], dist="UNPK_B16"), "float32"
+                            )
                             if has_initial:
-                                prediction01 = T.simd.vadd(
-                                    prediction[c], prediction[value_vectors + c], mask
-                                )
-                                prediction23 = T.simd.vadd(
-                                    prediction[2 * value_vectors + c],
-                                    prediction[3 * value_vectors + c],
-                                    mask,
-                                )
-                                prediction_sum = T.simd.vadd(prediction01, prediction23, mask)
-                                residual = T.simd.vsub(value_reg, prediction_sum, mask)
+                                _collapse_decode_stripes(prediction, c, value_vectors, mask)
+                                residual = T.simd.vsub(value_reg, prediction[c], mask)
                                 delta[c] = T.simd.vmul(residual, beta_reg, mask)
                             else:
                                 delta[c] = T.simd.vmul(value_reg, beta_reg, mask)
                         for g in range(dim_k // 4):
                             for r in T.Unroll(4, explicit=True):
                                 update_key = T.simd.vld(k_f32[g * 4 + r], dist="BRC_B32")
-                                query_reg = T.simd.vld(q_f32[g * 4 + r], dist="BRC_B32")
+                                if has_initial:
+                                    query_reg = T.simd.vld(q_f32[g * 4 + r], dist="BRC_B32")
                                 for c in T.Unroll(value_vectors, explicit=True):
                                     update_reg = T.simd.vmul(update_key, delta[c], mask)
                                     if has_initial:
@@ -165,20 +153,29 @@ def _build_dense_decode(
                                     else:
                                         next_state = update_reg
                                     T.simd.vsts(state_kv[g * 4 + r, c * 64], next_state, mask)
-                                    output_product = T.simd.vmul(next_state, query_reg, mask)
-                                    result[r * value_vectors + c] = T.simd.vadd(
-                                        result[r * value_vectors + c], output_product, mask
-                                    )
+                                    if has_initial:
+                                        output_product = T.simd.vmul(next_state, query_reg, mask)
+                                        result[r * value_vectors + c] = T.simd.vadd(
+                                            result[r * value_vectors + c], output_product, mask
+                                        )
+                        if not has_initial:
+                            # For a zero initial state, q @ (k * delta) = (q @ k) * delta.
+                            dot = T.simd.alloc_local(1, "float32")
+                            dot[0] = T.simd.vdup(T.float32(0), "float32", mask)
+                            for c in T.Unroll(dim_k // 64, explicit=True):
+                                qk = T.simd.vmul(
+                                    T.simd.vld(q_f32[c * 64]), T.simd.vld(k_f32[c * 64]), mask
+                                )
+                                dot[0] = T.simd.vadd(dot[0], qk, mask)
+                            qk_dot = T.simd.vdupv(T.simd.vcadd(dot[0], mask), mask)
                         for c in T.Unroll(value_vectors, explicit=True):
-                            result01 = T.simd.vadd(result[c], result[value_vectors + c], mask)
-                            result23 = T.simd.vadd(
-                                result[2 * value_vectors + c], result[3 * value_vectors + c], mask
-                            )
-                            result_sum = T.simd.vadd(result01, result23, mask)
-                            T.simd.vsts(output_f32[c * 64], result_sum, mask)
-                    with T.SimtVF(threads=threads):
-                        for j in T.Parallel(dim_v):
-                            output_ub[j] = T.cast(output_f32[j], dtype)
+                            if has_initial:
+                                _collapse_decode_stripes(result, c, value_vectors, mask)
+                                result_sum = result[c]
+                            else:
+                                result_sum = T.simd.vmul(qk_dot, delta[c], mask)
+                            narrowed = T.simd.vcvt(result_sum, dtype, round="ROUND_R", sat=False)
+                            T.simd.vsts(output_ub[c * 64], narrowed, mask, dist="PK_B32", extent=64)
                     T.copy(state_kv, Final[sequence, head, 0:dim_k, 0:dim_v])
                     T.copy(output_ub, Output[sequence, 0, head, 0:dim_v])
 
@@ -208,7 +205,7 @@ def _build_pack_grams(
     blocks = min(max_blocks, jobs)
     rounds = (jobs + blocks - 1) // blocks
     offset_storage = ((num_sequences + 4) // 4) * 4
-    meta_storage = ((num_sequences + 8) // 8) * 8
+    search_steps = (num_sequences - 1).bit_length()
     features = dim_k + dim_v
     rows = chunk // 2
     cast_threads = min(threads, dim_k)
@@ -225,17 +222,14 @@ def _build_pack_grams(
         QP: T.Tensor((slots, heads, chunk, dim_k), "float32"),
         KV: T.Tensor((slots, heads, chunk, features), "float32"),
         BP: T.Tensor((slots, heads, chunk), "float32"),
-        Meta: T.Tensor((num_sequences + 1,), "int32"),
-        Gram: T.Tensor((slots, heads, chunk, chunk), "float32"),
-        QK: T.Tensor((slots, heads, chunk, chunk), "float32"),
+        GramQK: T.Tensor((slots, heads, 2 * chunk, chunk), "float32"),
     ):
         with T.MixedKernel(blocks) as (block, sid):
             T.set_hf32_mode(hf32)
-            q_l1 = T.alloc_l1((chunk, dim_k), "float32")
+            kq_l1 = T.alloc_l1((2 * chunk, dim_k), "float32")
             k_l1 = T.alloc_l1((chunk, dim_k), "float32")
-            result = T.alloc_l0c((chunk, chunk), "float32")
+            result = T.alloc_l0c((2 * chunk, chunk), "float32")
             offsets_ub = T.alloc_shared((offset_storage,), "int64")
-            meta_ub = T.alloc_shared((meta_storage,), "int32")
             q_raw = T.alloc_shared((rows, dim_k), dtype)
             k_raw = T.alloc_shared((rows, dim_k), dtype)
             v_raw = T.alloc_shared((rows, dim_v), dtype)
@@ -246,7 +240,6 @@ def _build_pack_grams(
             b_ub = T.alloc_shared((rows,), "float32")
             versions = {
                 offsets_ub: 1,
-                meta_ub: 1,
                 q_raw: 1,
                 k_raw: 1,
                 v_raw: 1,
@@ -255,64 +248,42 @@ def _build_pack_grams(
                 k_ub: 1,
                 v_ub: 1,
                 b_ub: 1,
-                q_l1: 1,
+                kq_l1: 1,
                 k_l1: 1,
                 result: 1,
             }
             T.annotate_buffer_versions(versions)
             if packed:
                 T.copy(Offsets[0 : num_sequences + 1], offsets_ub[0 : num_sequences + 1])
-                with T.SimtVF(threads=32):
-                    prefix = T.alloc_fragment((num_sequences + 1,), "int32")
-                    for r in T.Parallel(num_sequences + 1):
-                        prefix[r] = 0
-                    for s in T.serial(num_sequences):
-                        for r in T.Parallel(num_sequences + 1):
-                            if r > s:
-                                prefix[r] = (
-                                    prefix[r]
-                                    + (
-                                        T.cast(offsets_ub[s + 1] - offsets_ub[s], "int32")
-                                        + chunk
-                                        - 1
-                                    )
-                                    // chunk
-                                )
-                    T.copy(prefix, meta_ub[0 : num_sequences + 1])
-            else:
-                with T.SimtVF(threads=32):
-                    for r in T.Parallel(num_sequences + 1):
-                        meta_ub[r] = r * dense_chunks
-            if block == 0 and sid == 0:
-                T.copy(meta_ub[0 : num_sequences + 1], Meta[0 : num_sequences + 1])
             for work_round in T.serial(rounds):
                 job = work_round * blocks + block
                 if job < jobs:
                     slot = job // heads
                     head = job % heads
-                    token_begin = T.alloc_var("int32")
-                    valid = T.alloc_var("int32")
                     if packed:
                         batch_index = T.int32(0)
-                        token_begin = 0
-                        valid = 0
-                        for sequence in T.serial(num_sequences):
-                            if slot >= meta_ub[sequence] and slot < meta_ub[sequence + 1]:
-                                token_begin = (
-                                    T.cast(offsets_ub[sequence], "int32")
-                                    + (slot - meta_ub[sequence]) * chunk
-                                )
-                                valid = T.min(
-                                    chunk, T.cast(offsets_ub[sequence + 1], "int32") - token_begin
-                                )
+                        # One extra slot per sequence covers a partial chunk.
+                        sequence = T.alloc_var("int32", init=0)
+                        if search_steps > 0:
+                            for level in T.Unroll(search_steps, explicit=True):
+                                step = 1 << (search_steps - level - 1)
+                                probe = sequence + T.min(step, num_sequences - 1 - sequence)
+                                if slot >= T.cast(offsets_ub[probe], "int32") // chunk + probe:
+                                    sequence = probe
+                        first_token = T.cast(offsets_ub[sequence], "int32")
+                        end_token = T.cast(offsets_ub[sequence + 1], "int32")
+                        first_slot = first_token // chunk + sequence
+                        remaining = end_token - first_token - (slot - first_slot) * chunk
+                        token_begin = end_token - T.max(0, remaining)
+                        valid = T.min(chunk, remaining)
                     else:
                         batch_index = slot // dense_chunks
                         token_begin = (slot % dense_chunks) * chunk
                         valid = T.min(chunk, seq_len - token_begin)
                     row_base = sid * rows
-                    local_begin = token_begin + row_base
                     local_valid = T.max(0, T.min(rows, valid - row_base))
                     if local_valid > 0:
+                        local_begin = token_begin + row_base
                         T.copy(
                             Q[batch_index, local_begin : local_begin + local_valid, head, 0:dim_k],
                             q_raw[0:local_valid, 0:dim_k],
@@ -340,8 +311,7 @@ def _build_pack_grams(
                             )
                     with T.SimdVF():
                         mask = T.simd.pset(32)
-                        q_vec = T.simd.alloc_local(key_vectors, "float32")
-                        k_vec = T.simd.alloc_local(key_vectors, "float32")
+                        qk = T.simd.alloc_local(2 * key_vectors, "float32")
                         sums = T.simd.alloc_local(2, "float32")
                         if normalize:
                             epsilon = T.simd.vdup(T.float32(1e-6), "float32", mask)
@@ -350,41 +320,34 @@ def _build_pack_grams(
                             for c in T.Unroll(key_vectors, explicit=True):
                                 q_input = T.simd.vld(q_raw[t, c * 64], dist="UNPK_B16")
                                 k_input = T.simd.vld(k_raw[t, c * 64], dist="UNPK_B16")
-                                q_vec[c] = T.simd.vcvt(q_input, "float32", part=0)
-                                k_vec[c] = T.simd.vcvt(k_input, "float32", part=0)
+                                qk[c] = T.simd.vcvt(q_input, "float32", part=0)
+                                qk[key_vectors + c] = T.simd.vcvt(k_input, "float32", part=0)
                             if normalize:
-                                sums[0] = T.simd.vdup(T.float32(0), "float32", mask)
-                                sums[1] = T.simd.vdup(T.float32(0), "float32", mask)
+                                inverse = T.simd.alloc_local(2, "float32")
+                                for group in T.Unroll(2, explicit=True):
+                                    sums[group] = T.simd.vdup(T.float32(0), "float32", mask)
                                 for c in T.Unroll(key_vectors, explicit=True):
-                                    q_squared = T.simd.vmul(q_vec[c], q_vec[c], mask)
-                                    k_squared = T.simd.vmul(k_vec[c], k_vec[c], mask)
-                                    sums[0] = T.simd.vadd(sums[0], q_squared, mask)
-                                    sums[1] = T.simd.vadd(sums[1], k_squared, mask)
-                                q_sum = T.simd.vcadd(sums[0], mask)
-                                k_sum = T.simd.vcadd(sums[1], mask)
-                                q_broadcast = T.simd.vdupv(q_sum, mask)
-                                k_broadcast = T.simd.vdupv(k_sum, mask)
-                                q_eps = T.simd.vadd(q_broadcast, epsilon, mask)
-                                k_eps = T.simd.vadd(k_broadcast, epsilon, mask)
-                                q_root = T.simd.vsqrt(q_eps, mask)
-                                k_root = T.simd.vsqrt(k_eps, mask)
-                                q_inverse = T.simd.vdiv(one, q_root, mask, precision="exact")
-                                k_inverse = T.simd.vdiv(one, k_root, mask, precision="exact")
+                                    for group in T.Unroll(2, explicit=True):
+                                        reg = qk[group * key_vectors + c]
+                                        squared = T.simd.vmul(reg, reg, mask)
+                                        sums[group] = T.simd.vadd(sums[group], squared, mask)
+                                for group in T.Unroll(2, explicit=True):
+                                    reduced = T.simd.vcadd(sums[group], mask)
+                                    broadcast = T.simd.vdupv(reduced, mask)
+                                    root = T.simd.vsqrt(T.simd.vadd(broadcast, epsilon, mask), mask)
+                                    inverse[group] = T.simd.vdiv(one, root, mask, precision="exact")
                                 for c in T.Unroll(key_vectors, explicit=True):
-                                    q_normalized = T.simd.vmul(q_vec[c], q_inverse, mask)
-                                    k_normalized = T.simd.vmul(k_vec[c], k_inverse, mask)
-                                    q_rounded = T.simd.vcvt(
-                                        q_normalized, dtype, round="ROUND_R", part=0
-                                    )
-                                    k_rounded = T.simd.vcvt(
-                                        k_normalized, dtype, round="ROUND_R", part=0
-                                    )
-                                    q_vec[c] = T.simd.vcvt(q_rounded, "float32", part=0)
-                                    k_vec[c] = T.simd.vcvt(k_rounded, "float32", part=0)
+                                    for group in T.Unroll(2, explicit=True):
+                                        index = group * key_vectors + c
+                                        normalized = T.simd.vmul(qk[index], inverse[group], mask)
+                                        rounded = T.simd.vcvt(
+                                            normalized, dtype, round="ROUND_R", part=0
+                                        )
+                                        qk[index] = T.simd.vcvt(rounded, "float32", part=0)
                             for c in T.Unroll(key_vectors, explicit=True):
-                                q_scaled = T.simd.vmuls(q_vec[c], T.float32(scale), mask)
+                                q_scaled = T.simd.vmuls(qk[c], T.float32(scale), mask)
                                 T.simd.vsts(q_ub[t, c * 64], q_scaled, mask)
-                                T.simd.vsts(k_ub[t, c * 64], k_vec[c], mask)
+                                T.simd.vsts(k_ub[t, c * 64], qk[key_vectors + c], mask)
                             for c in T.Unroll(value_vectors, explicit=True):
                                 value_input = T.simd.vld(v_raw[t, c * 64], dist="UNPK_B16")
                                 value_reg = T.simd.vcvt(value_input, "float32", part=0)
@@ -396,18 +359,17 @@ def _build_pack_grams(
                                 T.simd.vsts(k_ub[t, c * 64], zero, mask)
                             for c in T.Unroll(value_vectors, explicit=True):
                                 T.simd.vsts(v_ub[t, c * 64], zero, mask)
+                    T.dual_copy(k_ub, kq_l1[0:chunk, 0:dim_k])
+                    T.dual_copy(q_ub, kq_l1[chunk : 2 * chunk, 0:dim_k])
                     T.dual_copy(k_ub, k_l1)
-                    T.gemm(k_l1, k_l1, result, transpose_B=True, clear_accum=True)
-                    T.copy(result, Gram[slot, head, 0:chunk, 0:chunk])
-                    T.dual_copy(q_ub, q_l1)
-                    T.gemm(q_l1, k_l1, result, transpose_B=True, clear_accum=True)
-                    T.copy(result, QK[slot, head, 0:chunk, 0:chunk])
+                    T.gemm(kq_l1, k_l1, result, transpose_B=True, clear_accum=True)
+                    T.copy(result, GramQK[slot, head, 0 : 2 * chunk, 0:chunk])
                     T.copy(q_ub, QP[slot, head, row_base : row_base + rows, 0:dim_k])
                     T.copy(k_ub, KV[slot, head, row_base : row_base + rows, 0:dim_k])
                     T.copy(v_ub, KV[slot, head, row_base : row_base + rows, dim_k:features])
                     T.copy(b_ub, BP[slot, head, row_base : row_base + rows])
 
-    return tilelang.compile(pack_grams, target="ascend", out_idx=[5, 6, 7, 8, 9, 10])
+    return tilelang.compile(pack_grams, target="ascend", out_idx=[5, 6, 7, 8])
 
 
 @T.macro
@@ -462,7 +424,7 @@ def _build_solve(slots, heads, dim_k, dim_v, chunk, max_blocks, threads, panel, 
     @T.prim_func
     def main(
         KV: T.Tensor((slots, heads, chunk, features), "float32"),
-        Gram: T.Tensor((slots, heads, chunk, chunk), "float32"),
+        GramQK: T.Tensor((slots, heads, 2 * chunk, chunk), "float32"),
         BP: T.Tensor((slots, heads, chunk), "float32"),
         W: T.Tensor((slots, heads, chunk, dim_k), "float32"),
         UT: T.Tensor((slots, heads, dim_v, chunk), "float32"),
@@ -501,7 +463,7 @@ def _build_solve(slots, heads, dim_k, dim_v, chunk, max_blocks, threads, panel, 
                     head = job % heads
                     if not inverse:
                         T.copy(KV[slot, head, 0:chunk, 0:features], rhs_ub)
-                    T.copy(Gram[slot, head, 0:chunk, 0:chunk], gram_ub)
+                    T.copy(GramQK[slot, head, 0:chunk, 0:chunk], gram_ub)
                     T.copy(BP[slot, head, 0:chunk], beta_ub)
                     with T.SimtVF(threads=threads):
                         for i, j in T.Parallel(chunk, chunk):
@@ -568,6 +530,7 @@ def _build_fused_states_project(
     half_v = value_tile // 2
     key_vectors = dim_k // 64
     identity_tiles = dim_k // identity_rows
+    dense_chunks = (seq_len + chunk - 1) // chunk
 
     @T.prim_func
     def main(
@@ -575,9 +538,8 @@ def _build_fused_states_project(
         UT: T.Tensor((slots, heads, dim_v, chunk), "float32"),
         KP: T.Tensor((slots, heads, chunk, key_width), "float32"),
         QP: T.Tensor((slots, heads, chunk, dim_k), "float32"),
-        QK: T.Tensor((slots, heads, chunk, chunk), "float32"),
+        GramQK: T.Tensor((slots, heads, 2 * chunk, chunk), "float32"),
         Initial: T.Tensor((num_sequences, heads, dim_k, dim_v), "float32"),
-        Meta: T.Tensor((num_sequences + 1,), "int32"),
         Offsets: T.Tensor((num_sequences + 1,), "int64"),
         OP: T.Tensor((batch, seq_len, heads, dim_v), dtype),
         Final: T.Tensor((num_sequences, heads, dim_k, dim_v), "float32"),
@@ -648,16 +610,19 @@ def _build_fused_states_project(
                     sequence = job // (heads * value_tiles)
                     head = job // value_tiles % heads
                     value_begin = (job % value_tiles) * value_tile
-                    first_slot = Meta[sequence]
-                    end_slot = Meta[sequence + 1]
                     if packed:
                         batch_index = 0
                         first_token = T.cast(Offsets[sequence], "int32")
                         end_token = T.cast(Offsets[sequence + 1], "int32")
+                        first_slot = first_token // chunk + sequence
+                        length = T.cast(end_token - first_token, "int64")
+                        end_slot = first_slot + T.cast(T.ceildiv(length, chunk), "int32")
                     else:
                         batch_index = sequence
                         first_token = 0
                         end_token = seq_len
+                        first_slot = sequence * dense_chunks
+                        end_slot = first_slot + dense_chunks
                     if has_initial:
                         T.copy(
                             Initial[
@@ -715,7 +680,7 @@ def _build_fused_states_project(
                                     d_ub[x * 64 // chunk, x * 64 % chunk], delta_reg, delta_mask
                                 )
                         T.dual_copy(d_ub, d_l1)
-                        T.copy(QK[slot, head, 0:chunk, 0:chunk], g_ub)
+                        T.copy(GramQK[slot, head, chunk : 2 * chunk, 0:chunk], g_ub)
                         with T.SimtVF(threads=threads):
                             for i, j in T.Parallel(chunk, chunk):
                                 g_masked[i, j] = T.if_then_else(j <= i, g_ub[i, j], T.float32(0))
@@ -744,39 +709,26 @@ def _build_fused_states_project(
                         T.copy(KP[slot, head, 0:chunk, 0:dim_k], kt_l1, transpose=True)
                         T.copy(d_l1, left_l0[0:value_tile, 0:chunk])
                         T.copy(kt_l1, right_l0[0:dim_k, 0:chunk])
-                        if has_initial:
-                            T.gemm(
-                                left_l0[0:value_tile, 0:chunk],
-                                right_l0[0:dim_k, 0:chunk],
-                                state_acc,
-                                transpose_B=True,
-                                clear_accum=False,
-                            )
-                        else:
-                            T.gemm(
-                                left_l0[0:value_tile, 0:chunk],
-                                right_l0[0:dim_k, 0:chunk],
-                                state_acc,
-                                transpose_B=True,
-                                clear_accum=slot == first_slot,
-                            )
+                        T.gemm(
+                            left_l0[0:value_tile, 0:chunk],
+                            right_l0[0:dim_k, 0:chunk],
+                            state_acc,
+                            transpose_B=True,
+                            clear_accum=False if has_initial else slot == first_slot,
+                        )
                         T.dual_copy(state_acc, state_ub)
-                    if packed and has_initial:
-                        if first_slot == end_slot:
-                            local_value_begin = value_begin + sid * half_v
-                            T.copy(
-                                Initial[
-                                    sequence,
-                                    head,
-                                    0:dim_k,
-                                    local_value_begin : local_value_begin + half_v,
-                                ],
-                                final_ub,
-                            )
-                        else:
-                            with T.SimtVF(threads=threads):
-                                for i, j in T.Parallel(dim_k, half_v):
-                                    final_ub[i, j] = state_ub[j, i]
+                    empty_initial = first_slot == end_slot if packed and has_initial else False
+                    if empty_initial:
+                        local_value_begin = value_begin + sid * half_v
+                        T.copy(
+                            Initial[
+                                sequence,
+                                head,
+                                0:dim_k,
+                                local_value_begin : local_value_begin + half_v,
+                            ],
+                            final_ub,
+                        )
                     else:
                         with T.SimtVF(threads=threads):
                             for i, j in T.Parallel(dim_k, half_v):
@@ -786,7 +738,7 @@ def _build_fused_states_project(
                         Final[sequence, head, 0:dim_k, value_begin : value_begin + value_tile],
                     )
 
-    return tilelang.compile(main, target="ascend", out_idx=[8, 9])
+    return tilelang.compile(main, target="ascend", out_idx=[7, 8])
 
 
 class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
@@ -967,9 +919,9 @@ class AscendDeltaNetChunkedKernel(Kernel, DeltaNetFwdInterface):
             offsets_arg = torch.empty(self._offset_shape, dtype=torch.int64, device=q.device)
         # Device offsets are authoritative; workspaces are invocation-local.
         # Packing feeds Gram matrices directly into the triangular solve.
-        qp, kv, bp, meta, gram, qk = self._pack(q, k, v, beta, offsets_arg)
-        w, ut = self._solve(kv, gram, bp)
-        return self._states_project(w, ut, kv, qp, qk, state_arg, meta, offsets_arg)
+        qp, kv, bp, gram_qk = self._pack(q, k, v, beta, offsets_arg)
+        w, ut = self._solve(kv, gram_qk, bp)
+        return self._states_project(w, ut, kv, qp, gram_qk, state_arg, offsets_arg)
 
 
 tileops.backend.register_kernel_type("DeltaNetFwdOp", "ascend", AscendDeltaNetChunkedKernel)
