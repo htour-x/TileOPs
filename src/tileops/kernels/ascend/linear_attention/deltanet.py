@@ -302,7 +302,7 @@ def _build_prefill(call, dtype, slots, value_tile, hf32):
             T.set_hf32_mode(hf32)
             # Pad the final inverse row for a full-width SIMD load.
             rhs = T.alloc_shared((chunk + 1, chunk), "float32")
-            gram = T.alloc_shared((chunk, chunk), "float32")
+            gram = T.alloc_shared((chunk + 1, chunk), "float32")
             beta = T.alloc_shared((chunk,), "float32")
             inv_l1 = T.alloc_l1((2 * chunk, chunk), "float32")
             rhs_l1 = T.alloc_l1((2 * dim, chunk), "float32")
@@ -315,19 +315,24 @@ def _build_prefill(call, dtype, slots, value_tile, hf32):
                 # Both AIVs participate even when the final pair has just one chunk.
                 job = T.min(pair * 2 + sid, chunk_jobs - 1)
                 slot, head = job // heads, job % heads
-                T.copy(GramQK[slot, head, 0:chunk, 0:chunk], gram)
+                T.copy(GramQK[slot, head, 0:chunk, 0:chunk], gram[0:chunk, 0:chunk])
                 T.copy(BP[slot, head, 0:chunk], beta)
-                with T.SimtVF(threads=_THREADS):
-                    for i, j in T.Parallel(chunk, chunk):
-                        gram[i, j] = -(gram[i, j] * beta[i])
-                        rhs[i, j] = T.if_then_else(i == j, beta[j], T.float32(0))
                 with T.SimdVF():
                     mask = T.simd.pset(32, "PAT_VL32")
+                    lanes = T.simd.vci(T.int32(0), "int32")
+                    zero = T.simd.vdup(T.float32(0), "float32", mask)
+                    for i in range(chunk):
+                        weight = T.simd.vld(beta[i], dist="BRC_B32")
+                        weighted = T.simd.vmul(T.simd.vld(gram[i, 0]), weight, mask)
+                        T.simd.vsts(gram[i, 0], T.simd.vneg(weighted, mask), mask, extent=chunk)
+                    T.simd.mem_bar("VST_VLD")
                     rows = T.simd.alloc_local(panel, "float32")
                     for p in range(_CHUNK // panel):
                         base = p * panel
                         for i in T.Unroll(panel, explicit=True):
-                            rows[i] = T.simd.vld(rhs[base + i, 0])
+                            diagonal = T.simd.vcmps(lanes, base + i, mask, op="eq")
+                            weight = T.simd.vld(beta[base + i], dist="BRC_B32")
+                            rows[i] = T.simd.vsel(weight, zero, diagonal)
                         for j in range(base):
                             pivot = T.simd.vld(rhs[j, 0])
                             for i in T.Unroll(panel, explicit=True):
